@@ -49,7 +49,7 @@ impl TextOffsetAdjustment {
 }
 
 pub struct DropInformation {
-    pub target_element_node: element_selection::ElementRcNode,
+    pub target_element_node: common::ElementRcNode,
     pub insertion_position: common::VersionedPosition,
 }
 
@@ -57,9 +57,11 @@ fn find_drop_location(
     component_instance: &ComponentInstance,
     x: f32,
     y: f32,
+    component_type: &str,
 ) -> Option<DropInformation> {
     let target_element_node = {
         let mut result = None;
+        let tl = component_instance.definition().type_loader();
         for sc in &element_selection::collect_all_element_nodes_covering(x, y, &component_instance)
         {
             let Some(en) = sc.as_element_node() else {
@@ -70,14 +72,23 @@ fn find_drop_location(
                 continue;
             }
 
-            if !element_selection::is_same_file_as_root_node(&component_instance, &en) {
+            let (path, _) = en.path_and_offset();
+            let Some(doc) = tl.get_document(&path) else {
                 continue;
+            };
+            if let Some(element_type) = en.with_element_node(|node| {
+                util::lookup_current_element_type((node.clone()).into(), &doc.local_registry)
+            }) {
+                if !en.is_layout()
+                    && element_type
+                        .accepts_child_element(component_type, &doc.local_registry)
+                        .is_err()
+                {
+                    break;
+                }
             }
 
-            if en.with_element_node(|n| {
-                n.child_node(i_slint_compiler::parser::SyntaxKind::ChildrenPlaceholder).is_some()
-            }) && !element_selection::is_root_element_node(&component_instance, &en)
-            {
+            if !element_selection::is_same_file_as_root_node(&component_instance, &en) {
                 continue;
             }
 
@@ -105,8 +116,11 @@ fn find_drop_location(
 }
 
 /// Find the Element to insert into. None means we can not insert at this point.
-pub fn can_drop_at(x: f32, y: f32) -> bool {
-    super::component_instance().and_then(|ci| find_drop_location(&ci, x, y)).is_some()
+pub fn can_drop_at(x: f32, y: f32, component: &common::ComponentInformation) -> bool {
+    let component_type = component.name.to_string();
+    super::component_instance()
+        .and_then(|ci| find_drop_location(&ci, x, y, &component_type))
+        .is_some()
 }
 
 /// Extra data on an added Element, relevant to the Preview side only.
@@ -116,6 +130,7 @@ pub struct DropData {
     /// due to indentation, etc.
     pub selection_offset: u32,
     pub path: std::path::PathBuf,
+    pub is_layout: bool,
 }
 
 /// Find a location in a file that would be a good place to insert the new component at
@@ -125,48 +140,44 @@ pub struct DropData {
 pub fn drop_at(
     x: f32,
     y: f32,
-    component_type: String,
-    import_path: String,
+    component: &common::ComponentInformation,
 ) -> Option<(lsp_types::WorkspaceEdit, DropData)> {
+    let component_type = &component.name;
     let component_instance = preview::component_instance()?;
     let tl = component_instance.definition().type_loader();
-    let drop_info = find_drop_location(&component_instance, x, y)?;
+    let drop_info = find_drop_location(&component_instance, x, y, &component_type)?;
 
     let properties = {
+        let mut props = component.default_properties.clone();
+
         let click_position =
             LogicalPoint::from_lengths(LogicalLength::new(x), LogicalLength::new(y));
 
-        if drop_info.target_element_node.is_layout() {
-            vec![]
-        } else if let Some(area) = component_instance
-            .element_position(&drop_info.target_element_node.element)
-            .iter()
-            .find(|p| p.contains(click_position))
-        {
-            vec![
-                ("x".to_string(), format!("{}px", x - area.origin.x)),
-                ("y".to_string(), format!("{}px", y - area.origin.y)),
-            ]
-        } else {
-            vec![]
+        if !drop_info.target_element_node.is_layout() && !component.fills_parent {
+            if let Some(area) = component_instance
+                .element_position(&drop_info.target_element_node.element)
+                .iter()
+                .find(|p| p.contains(click_position))
+            {
+                props.push(common::PropertyChange::new("x", format!("{}px", x - area.origin.x)));
+                props.push(common::PropertyChange::new("y", format!("{}px", y - area.origin.y)));
+            }
         }
+
+        props
     };
 
     let indentation = format!(
         "{}    ",
-        crate::util::find_element_node_indent(
-            &drop_info.target_element_node.element,
-            drop_info.target_element_node.debug_index
-        )
-        .unwrap_or_default()
+        crate::util::find_element_indent(&drop_info.target_element_node).unwrap_or_default()
     );
 
     let new_text = if properties.is_empty() {
         format!("{}{} {{ }}\n", indentation, component_type)
     } else {
         let mut to_insert = format!("{}{} {{\n", indentation, component_type);
-        for (k, v) in &properties {
-            to_insert += &format!("{}    {k}: {v};\n", indentation);
+        for p in &properties {
+            to_insert += &format!("{}    {}: {};\n", indentation, p.name, p.value);
         }
         to_insert += &format!("{}}}\n", indentation);
         to_insert
@@ -180,7 +191,8 @@ pub fn drop_at(
 
     let doc = tl.get_document(&path)?;
     let mut edits = Vec::with_capacity(2);
-    if let Some(edit) = completion::create_import_edit(doc, &component_type, &Some(import_path)) {
+    let import_file = component.import_file_name(&lsp_types::Url::from_file_path(&path).ok());
+    if let Some(edit) = completion::create_import_edit(doc, component_type, &import_file) {
         if let Some(sf) = doc.node.as_ref().map(|n| &n.source_file) {
             selection_offset = TextOffsetAdjustment::new(&edit, sf).adjust(selection_offset);
         }
@@ -194,6 +206,6 @@ pub fn drop_at(
 
     Some((
         common::create_workspace_edit_from_source_file(&source_file, edits)?,
-        DropData { selection_offset, path },
+        DropData { selection_offset, path, is_layout: component.is_layout },
     ))
 }

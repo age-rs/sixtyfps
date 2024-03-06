@@ -4,6 +4,7 @@
 //! Data structures common between LSP and previewer
 
 use i_slint_compiler::diagnostics::{SourceFile, SourceFileVersion};
+use i_slint_compiler::object_tree::ElementRc;
 use lsp_types::{TextEdit, Url, WorkspaceEdit};
 
 use std::{collections::HashMap, path::PathBuf};
@@ -14,6 +15,59 @@ pub type UrlVersion = Option<i32>;
 
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_prelude::*;
+
+#[derive(Clone)]
+pub struct ElementRcNode {
+    pub element: ElementRc,
+    pub debug_index: usize,
+}
+
+impl std::fmt::Debug for ElementRcNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (path, offset) = self.path_and_offset();
+        write!(f, "ElementNode {{ {path:?}:{offset} }}")
+    }
+}
+
+impl ElementRcNode {
+    pub fn find_in(element: ElementRc, path: &std::path::Path, offset: u32) -> Option<Self> {
+        let debug_index = element.borrow().debug.iter().position(|(n, _)| {
+            u32::from(n.text_range().start()) == offset && n.source_file.path() == path
+        })?;
+
+        Some(Self { element, debug_index })
+    }
+
+    pub fn with_element_debug<R>(
+        &self,
+        func: impl Fn(
+            &i_slint_compiler::parser::syntax_nodes::Element,
+            &Option<i_slint_compiler::layout::Layout>,
+        ) -> R,
+    ) -> R {
+        let elem = self.element.borrow();
+        let (n, l) = &elem.debug.get(self.debug_index).unwrap();
+        func(n, l)
+    }
+
+    pub fn with_element_node<R>(
+        &self,
+        func: impl Fn(&i_slint_compiler::parser::syntax_nodes::Element) -> R,
+    ) -> R {
+        let elem = self.element.borrow();
+        func(&elem.debug.get(self.debug_index).unwrap().0)
+    }
+
+    pub fn path_and_offset(&self) -> (PathBuf, u32) {
+        self.with_element_node(|n| {
+            (n.source_file.path().to_owned(), u32::from(n.text_range().start()))
+        })
+    }
+
+    pub fn is_layout(&self) -> bool {
+        self.with_element_debug(|_, l| l.is_some())
+    }
+}
 
 pub fn create_workspace_edit(
     uri: Url,
@@ -153,7 +207,7 @@ pub struct Diagnostic {
 }
 
 #[allow(unused)]
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Eq, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PropertyChange {
     pub name: String,
     pub value: String,
@@ -180,7 +234,8 @@ pub enum PreviewToLspMessage {
     /// Request all documents and configuration to be sent from the LSP to the
     /// Preview.
     RequestState { unused: bool },
-    /// Update an existing Element (REMOVE THIS)
+    /// Update properties on an element at `position`
+    /// The LSP side needs to look at properties: It sees way more of them!
     UpdateElement {
         label: Option<String>,
         position: VersionedPosition,
@@ -207,8 +262,12 @@ pub struct ComponentInformation {
     pub is_exported: bool,
     /// This is a layout
     pub is_layout: bool,
+    /// This element fills its parent
+    pub fills_parent: bool,
     /// The URL to the file containing this type
     pub defined_at: Option<Position>,
+    /// Default property values
+    pub default_properties: Vec<PropertyChange>,
 }
 
 impl ComponentInformation {

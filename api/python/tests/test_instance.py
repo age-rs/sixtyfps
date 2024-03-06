@@ -31,7 +31,7 @@ def test_property_access():
             in property <bool> boolprop: true;
             in property <image> imgprop;
             in property <brush> brushprop: Colors.rgb(255, 0, 255);
-            in property <color> colprop;
+            in property <color> colprop: Colors.rgb(0, 255, 0);
             in property <[string]> modelprop;
             in property <MyStruct> structprop: {
                 title: "builtin",
@@ -104,6 +104,12 @@ def test_property_access():
     brushval = instance.get_property("brushprop")
     assert str(brushval.color) == "argb(255, 128, 128, 128)"
 
+    brushval = instance.get_property("colprop")
+    assert str(brushval.color) == "argb(255, 0, 255, 0)"
+    instance.set_property("colprop", Color("rgb(128, 128, 128)"))
+    brushval = instance.get_property("colprop")
+    assert str(brushval.color) == "argb(255, 128, 128, 128)"
+
     with pytest.raises(ValueError, match="no such property"):
         instance.set_global_property("nonexistent", "theglobalprop", 42)
     with pytest.raises(ValueError, match="no such property"):
@@ -163,8 +169,9 @@ def test_callbacks():
 
 if __name__ == "__main__":
     import slint
-    instance = slint.load_file(
+    module = slint.load_file(
         "../../examples/printerdemo/ui/printerdemo.slint")
-    instance.set_global_callback(
-        "PrinterQueue", "start-job", lambda title: print(f"new print job {title}"))
+    instance = module.MainWindow()
+    instance.PrinterQueue.start_job = lambda title: print(
+        f"new print job {title}")
     instance.run()
